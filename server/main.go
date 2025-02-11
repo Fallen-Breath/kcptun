@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
+	"github.com/pires/go-proxyproto"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/kcptun/generic"
@@ -40,6 +41,9 @@ func handleMux(conn net.Conn, config *Config) {
 	var isUnix bool
 	if _, _, err := net.SplitHostPort(config.Target); err != nil {
 		isUnix = true
+		if config.ProxyProtocol > 0 {
+			log.Println("proxy protocol warning: UNIX domain socket is not supported") // proxy protocol requires src and dest has same family
+		}
 	}
 	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
 
@@ -78,12 +82,12 @@ func handleMux(conn net.Conn, config *Config) {
 				p1.Close()
 				return
 			}
-			handleClient(p1, p2, config.Quiet)
+			handleClient(p1, p2, config.Quiet, byte(config.ProxyProtocol))
 		}(stream)
 	}
 }
 
-func handleClient(p1 *smux.Stream, p2 net.Conn, quiet bool) {
+func handleClient(p1 *smux.Stream, p2 net.Conn, quiet bool, proxyprotocol byte) {
 	logln := func(v ...interface{}) {
 		if !quiet {
 			log.Println(v...)
@@ -95,6 +99,27 @@ func handleClient(p1 *smux.Stream, p2 net.Conn, quiet bool) {
 
 	logln("stream opened", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
 	defer logln("stream closed", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
+
+	// send proxy protocol header
+	if proxyprotocol > 0 {
+		r1 := p1.RemoteAddr()
+		if _, ok := r1.(*net.UDPAddr); ok {
+			// proxy protocol requires src and dest has same family
+			// p1 is udp, fake it as tcp addr
+			// p2 is tcp or unix, for unix just give up
+			r1 = &net.TCPAddr{
+				IP:   p1.RemoteAddr().(*net.UDPAddr).IP,
+				Port: p1.RemoteAddr().(*net.UDPAddr).Port,
+				Zone: p1.RemoteAddr().(*net.UDPAddr).Zone,
+			}
+		}
+		header := proxyproto.HeaderProxyFromAddrs(proxyprotocol, r1, p2.RemoteAddr())
+		log.Println("proxy protocol header:", header)
+		_, err := header.WriteTo(p2)
+		if err != nil {
+			logln("write proxy protocol header:", err, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.RemoteAddr(), ")"))
+		}
+	}
 
 	// start tunnel & wait for tunnel termination
 	streamCopy := func(dst io.Writer, src io.ReadCloser) {
@@ -272,6 +297,11 @@ func main() {
 			Value: "", // when the value is not empty, the config path must exists
 			Usage: "config from json file, which will override the command from shell",
 		},
+		cli.IntFlag{
+			Name:  "proxyprotocol",
+			Value: 0,
+			Usage: "enable proxy protocol, 0 for disable, 1 for v1, 2 for v2",
+		},
 	}
 	myApp.Action = func(c *cli.Context) error {
 		config := Config{}
@@ -303,6 +333,7 @@ func main() {
 		config.Pprof = c.Bool("pprof")
 		config.Quiet = c.Bool("quiet")
 		config.TCP = c.Bool("tcp")
+		config.ProxyProtocol = c.Int("proxyprotocol")
 
 		if c.String("c") != "" {
 			//Now only support json config file
@@ -350,10 +381,14 @@ func main() {
 		log.Println("pprof:", config.Pprof)
 		log.Println("quiet:", config.Quiet)
 		log.Println("tcp:", config.TCP)
+		log.Println("proxyprotocol:", config.ProxyProtocol)
 
 		// parameters check
 		if config.SmuxVer > maxSmuxVer {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
+		}
+		if config.ProxyProtocol > 2 || config.ProxyProtocol < 0 {
+			log.Fatal("unsupported proxy protocol version:", config.ProxyProtocol)
 		}
 
 		log.Println("initiating key derivation")
